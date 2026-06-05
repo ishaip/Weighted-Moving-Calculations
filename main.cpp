@@ -25,7 +25,9 @@ int main() {
     cout << "=== Time-Weighted Moving Calculations ===" << endl;
     cout << endl;
 
-    // Step 1: Read first and last timestamp for window calculation
+    // Pass 1: Load all data and find the first valid timestamp (where the 30s window
+    // fills up) and the last timestamp (where we stop processing).
+    // This one-pass read is needed to set boundaries for our sliding window queries.
     FileProcessor processor;
     auto [timestamps, prices] = processor.ReadSecurityCSV("security1.csv");
 
@@ -41,34 +43,19 @@ int main() {
     cout << "Loaded " << timestamps.size() << " data points" << endl;
     cout << "First timestamp: " << firstTimestamp << endl;
     cout << "Last timestamp: " << lastTimestamp << endl;
-    cout << endl;
+    couPass 2-5: Run the four independent calculation pipelines.
+    // Each one re-opens the CSV file and streams chunks through its own calculator,
+    // then writes to its own output file. There's zero shared state between them.
+    //
+    // THREADING OPPORTUNITY: These 4 calls are embarrassingly parallel. Wrapping
+    // them in std::async or std::thread would give ~4x speedup with minimal change:
+    //   auto t1 = std::async(std::launch::async, [&] { return processor.ProcessTWMATimestamps(...); });
+    //   auto t2 = std::async(std::launch::async, [&] { return processor.ProcessTWMAIntervals(...); });
+    //   auto t3 = std::async(std::launch::async, [&] { return processor.ProcessTWMMTimestamps(...); });
+    //   auto t4 = std::async(std::launch::async, [&] { return processor.ProcessTWMMIntervals(...); });
+    //   t1.get(); t2.get(); t3.get(); t4.get();
 
     // Step 2-5: FileProcessor handles all file reading/writing in chunks
-    // MULTITHREADING OPPORTUNITY: Parallelize the 4 Process* calls below
-    //
-    // Current (Sequential): ~140+ seconds total
-    //   processor.ProcessTWMATimestamps(...);  // ~35s
-    //   processor.ProcessTWMAIntervals(...);   // ~35s
-    //   processor.ProcessTWMMTimestamps(...);  // ~35s
-    //   processor.ProcessTWMMIntervals(...);   // ~35s
-    //
-    // Parallelized (4 threads): ~35-40 seconds total (4x speedup)
-    //   std::thread t1(&FileProcessor::ProcessTWMATimestamps, &processor, ...);
-    //   std::thread t2(&FileProcessor::ProcessTWMAIntervals, &processor, ...);
-    //   std::thread t3(&FileProcessor::ProcessTWMMTimestamps, &processor, ...);
-    //   std::thread t4(&FileProcessor::ProcessTWMMIntervals, &processor, ...);
-    //   t1.join(); t2.join(); t3.join(); t4.join();
-    //
-    // Why this works:
-    //   - Each Process* method reads entire security1.csv (independent reads OK)
-    //   - Each writes to different output file (no file contention)
-    //   - Each uses separate calculator instance (no shared state)
-    //   - No synchronization needed between threads
-    //
-    // For even more parallelism within each Process method:
-    //   - Use producer-consumer queue for chunk read-ahead
-    //   - See comments in calculator.cpp ProcessTWMA/TWMM methods for details
-
     processor.ProcessTWMATimestamps("security1.csv", windowStart, lastTimestamp);
     processor.ProcessTWMAIntervals("security1.csv", windowStart, lastTimestamp);
     processor.ProcessTWMMTimestamps("security1.csv", windowStart, lastTimestamp);

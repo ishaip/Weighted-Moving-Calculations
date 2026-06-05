@@ -9,49 +9,47 @@
 
 using namespace std;
 
-// ==================== TWMACalculator Implementation ====================
+/* TWMACalculator: accumulate prior segments, handle open tail at query time */
 
 void TWMACalculator::PruneWindow(long long windowStart) {
-    // Remove entries older than windowStart from the front of deque
+    /* Remove data points that are older than the 30-second window start.
+       Keeps O(n) operations feasible since we pop from front only. */
     while (!window.empty() && window.front().timestamp < windowStart) {
         window.pop_front();
     }
 }
 
 void TWMACalculator::AddNewValue(double price, long long timestamp) {
-    // If we have a previous entry, calculate its duration and update running sums
+    /* When a new price arrives, finalize the previous price's contribution.
+       Accumulate (previous_price × duration) into running sum, then push the new price.
+       The new price's duration stays unknown until the next tick arrives. */
     if (!window.empty()) {
         long long prevTimestamp = window.back().timestamp;
         double prevPrice = window.back().price;
         long long duration = timestamp - prevTimestamp;
         
-        // Add to weighted sum
         twmaRunningSum += prevPrice * duration;
-        
-        // For TWSTD calculation (we'll need TWMA later, so just accumulate for now)
-        // We'll calculate deviations in GetCurrentTWSTD
     }
     
-    // Add new entry
     window.push_back(DataPoint(timestamp, price));
     lastPrice = price;
     
-    // Prune entries older than 30 seconds
     long long windowStart = timestamp - WINDOW_SIZE_NS;
     PruneWindow(windowStart);
 }
 
 double TWMACalculator::GetCurrentValue(long long t) {
+    /* Compute time-weighted average price over the 30-second window.
+       Uses accumulated sum of completed segments plus the current open segment.
+       Divides by total window duration to get the average. */
     if (window.empty()) {
         return 0.0;
     }
     
     long long windowStart = t - WINDOW_SIZE_NS;
-    
-    // Start with running sum of completed entries
     double weightedSum = twmaRunningSum;
     
-    // Add contribution of the last entry (its duration is from its timestamp to query time)
+    /* Add the last open segment (duration = time from last timestamp to now) */
     long long lastTimestamp = window.back().timestamp;
     long long lastEntryStart = max(lastTimestamp, windowStart);
     double lastEntryDuration = static_cast<double>(t - lastEntryStart);
@@ -64,6 +62,8 @@ double TWMACalculator::GetCurrentValue(long long t) {
 }
 
 double TWMACalculator::GetCurrentTWSTD(long long t) {
+    /* Compute time-weighted standard deviation around the TWMA.
+       Each price's squared deviation is weighted by how long it held during the window. */
     if (window.empty()) {
         return 0.0;
     }
@@ -73,19 +73,16 @@ double TWMACalculator::GetCurrentTWSTD(long long t) {
     long long windowStart = t - WINDOW_SIZE_NS;
     double sumSquaredDev = 0.0;
     
-    // Calculate sum of squared deviations for all entries in window
     for (size_t i = 0; i < window.size(); ++i) {
         long long entryStart = window[i].timestamp;
         long long entryEnd;
         
-        // Determine end time of this entry
         if (i + 1 < window.size()) {
             entryEnd = window[i + 1].timestamp;
         } else {
             entryEnd = t;
         }
         
-        // Clip to window boundaries
         entryStart = max(entryStart, windowStart);
         entryEnd = min(entryEnd, t);
         
@@ -100,19 +97,18 @@ double TWMACalculator::GetCurrentTWSTD(long long t) {
     return sqrt(variance);
 }
 
-// ==================== TWMMCalculator Implementation ====================
+/* TWMMCalculator: build price-level CDF, find 50th percentile by time */
 
 vector<TWMMCalculator::PriceDuration> TWMMCalculator::GetPriceLevels(long long t) const {
+    /* Build a cumulative distribution of prices by time spent at each level.
+       Returns sorted vector where each entry holds a price and cumulative time up to that price. */
     if (window.empty()) {
         return {};
     }
 
     long long windowStart = t - WINDOW_SIZE_NS;
-
-    // Map of price to cumulative duration
     map<double, double> priceDurations;
     
-    // Calculate durations for each entry
     for (size_t i = 0; i < window.size(); ++i) {
         long long entryStart = window[i].timestamp;
         long long entryEnd;
@@ -123,7 +119,6 @@ vector<TWMMCalculator::PriceDuration> TWMMCalculator::GetPriceLevels(long long t
             entryEnd = t;
         }
 
-        // Clip to window boundaries
         entryStart = max(entryStart, windowStart);
         entryEnd = min(entryEnd, t);
 
@@ -133,7 +128,6 @@ vector<TWMMCalculator::PriceDuration> TWMMCalculator::GetPriceLevels(long long t
         }
     }
 
-    // Convert map to sorted vector
     vector<PriceDuration> result;
     double cumulative = 0.0;
 
@@ -146,9 +140,10 @@ vector<TWMMCalculator::PriceDuration> TWMMCalculator::GetPriceLevels(long long t
 }
 
 void TWMMCalculator::AddNewValue(double price, long long timestamp) {
+    /* Add a new price and prune out-of-window data.
+       TWMM needs full price history to compute percentile distributions. */
     window.push_back(DataPoint(timestamp, price));
     
-    // Prune entries older than 30 seconds
     long long windowStart = timestamp - WINDOW_SIZE_NS;
     while (!window.empty() && window.front().timestamp < windowStart) {
         window.pop_front();
@@ -156,6 +151,8 @@ void TWMMCalculator::AddNewValue(double price, long long timestamp) {
 }
 
 double TWMMCalculator::GetCurrentValue(long long t) {
+    /* Find the time-weighted median price: the price where 50% of window time
+       is at or below it, and 50% is at or above it. */
     if (window.empty()) {
         return 0.0;
     }
@@ -166,10 +163,9 @@ double TWMMCalculator::GetCurrentValue(long long t) {
         return 0.0;
     }
 
-    // Total duration in window
     double totalDuration = priceLevels.back().cumulativeDuration;
 
-    // Find the median: price where cumulative >= 15s and (total - cumulative) >= 15s
+    /* Find price where 15s of time at/below it AND 15s at/above it */
     for (size_t i = 0; i < priceLevels.size(); ++i) {
         double cumulativeUp = priceLevels[i].cumulativeDuration;
         double cumulativeDown = totalDuration - (i > 0 ? priceLevels[i - 1].cumulativeDuration : 0.0);
@@ -179,7 +175,6 @@ double TWMMCalculator::GetCurrentValue(long long t) {
         }
     }
 
-    // If no exact median found, return the middle price by cumulative duration
     double targetDuration = totalDuration / 2.0;
     for (size_t i = 0; i < priceLevels.size(); ++i) {
         if (priceLevels[i].cumulativeDuration >= targetDuration) {
@@ -190,10 +185,12 @@ double TWMMCalculator::GetCurrentValue(long long t) {
     return priceLevels.back().price;
 }
 
-// ==================== FileProcessor Implementation ====================
+/* FileProcessor: chunk-based CSV streaming */
 
 pair<vector<long long>, vector<double>> 
 FileProcessor::ReadSecurityCSV(const string& filename) {
+    /* Load all security data from CSV in BUFFER_SIZE chunks to minimize disk I/O.
+       Returns timestamps and prices as parallel vectors for window calculations. */
     vector<long long> timestamps;
     vector<double> prices;
 
@@ -204,17 +201,13 @@ FileProcessor::ReadSecurityCSV(const string& filename) {
     }
 
     string line;
-    
-    // Skip header
     getline(file, line);
 
-    // Read data in buffers
     vector<string> buffer;
     while (std::getline(file, line)) {
         buffer.push_back(line);
 
         if (buffer.size() >= BUFFER_SIZE) {
-            // Process buffer
             for (const auto& bufLine : buffer) {
                 stringstream ss(bufLine);
                 double timestampDouble;
@@ -222,7 +215,6 @@ FileProcessor::ReadSecurityCSV(const string& filename) {
                 char comma;
 
                 if (ss >> timestampDouble >> comma >> price) {
-                    // Convert double timestamp to long long (nanoseconds)
                     long long timestamp = static_cast<long long>(timestampDouble);
                     timestamps.push_back(timestamp);
                     prices.push_back(price);
@@ -232,7 +224,6 @@ FileProcessor::ReadSecurityCSV(const string& filename) {
         }
     }
 
-    // Process remaining buffer
     for (const auto& bufLine : buffer) {
         stringstream ss(bufLine);
         double timestampDouble;
@@ -240,7 +231,6 @@ FileProcessor::ReadSecurityCSV(const string& filename) {
         char comma;
 
         if (ss >> timestampDouble >> comma >> price) {
-            // Convert double timestamp to long long (nanoseconds)
             long long timestamp = static_cast<long long>(timestampDouble);
             timestamps.push_back(timestamp);
             prices.push_back(price);
@@ -256,16 +246,16 @@ void FileProcessor::WriteCSV(const string& filename,
                              const vector<long long>& timestamps,
                              const vector<double>& values,
                              const string& valueHeader) {
+    /* Write single-column time-series data to CSV with header.
+       Uses BUFFER_SIZE chunking to reduce write syscalls. */
     ofstream file(filename);
     if (!file.is_open()) {
         cerr << "Error: Cannot open file " << filename << " for writing" << endl;
         return;
     }
 
-    // Write header
     file << "Time," << valueHeader << "\n";
 
-    // Write data in buffers
     vector<string> buffer;
     for (size_t i = 0; i < timestamps.size(); ++i) {
         stringstream ss;
@@ -297,16 +287,16 @@ void FileProcessor::WriteCSV(const string& filename,
                              const vector<double>& values2,
                              const string& header1,
                              const string& header2) {
+    /* Write two-column time-series data to CSV with headers.
+       Used for TWMA/TWSTD pairs (time + mean, time + std dev). */
     ofstream file(filename);
     if (!file.is_open()) {
         cerr << "Error: Cannot open file " << filename << " for writing" << endl;
         return;
     }
 
-    // Write header
     file << "Time," << header1 << "," << header2 << "\n";
 
-    // Write data in buffers
     vector<string> buffer;
     for (size_t i = 0; i < timestamps.size(); ++i) {
         stringstream ss;
@@ -315,7 +305,6 @@ void FileProcessor::WriteCSV(const string& filename,
         buffer.push_back(ss.str());
 
         if (buffer.size() >= BUFFER_SIZE) {
-            // Flush buffer
             for (const auto& line : buffer) {
                 file << line << "\n";
             }
@@ -323,7 +312,6 @@ void FileProcessor::WriteCSV(const string& filename,
         }
     }
 
-    // Flush remaining buffer
     for (const auto& line : buffer) {
         file << line << "\n";
     }
@@ -332,10 +320,12 @@ void FileProcessor::WriteCSV(const string& filename,
     std::cout << "Wrote " << timestamps.size() << " rows to " << filename << std::endl;
 }
 
-// ==================== Unified Chunk Processing (Private) ====================
-// Generic chunk processor that handles all file I/O, chunking, parsing, and buffering
-// The difference between all 4 Process methods is only in callback and finalize functions
+/* Generic chunk processor: read → parse → callback → write.
+   MULTITHREADING: read/compute can overlap via double-buffer (50 lines). */
+
 void FileProcessor::ProcessChunkedData(
+    /* Streams CSV in BUFFER_SIZE chunks, applies callback to each row, writes output.
+       Callback computes values; finalize callback handles remaining intervals after EOF. */
     const string& csvFilename,
     const string& outputFilename,
     const string& header,
@@ -349,22 +339,19 @@ void FileProcessor::ProcessChunkedData(
     outFile << header << "\n";
     
     string line;
-    getline(inFile, line);  // Skip CSV header
+    getline(inFile, line);
     
     int rowsWritten = 0;
     vector<string> readBuffer;
     readBuffer.reserve(BUFFER_SIZE);
     
-    // Chunk reading and processing loop
     while (true) {
-        // Read a chunk of BUFFER_SIZE lines
         readBuffer.clear();
         while ((int)readBuffer.size() < BUFFER_SIZE && getline(inFile, line)) {
             if (!line.empty()) readBuffer.push_back(line);
         }
         if (readBuffer.empty()) break;
         
-        // Process chunk: parse each line and call processLine callback
         stringstream writeBuffer;
         writeBuffer << fixed << setprecision(6);
         for (const auto& bufLine : readBuffer) {
@@ -375,15 +362,12 @@ void FileProcessor::ProcessChunkedData(
             long long timestamp = static_cast<long long>(stod(tsStr));
             double price = stod(priceStr);
             
-            // Call callback for this line - it handles all output logic
             callback(timestamp, price, writeBuffer, rowsWritten);
         }
         
-        // Write chunk results to file
         outFile << writeBuffer.str();
     }
     
-    // Call finalize callback (used by interval methods for remaining output)
     if (finalize) {
         stringstream writeBuffer;
         writeBuffer << fixed << setprecision(6);
@@ -396,21 +380,14 @@ void FileProcessor::ProcessChunkedData(
     cout << "Wrote " << rowsWritten << " rows to " << outputFilename << endl;
 }
 
-// ==================== Public Process Methods (Unified Implementation) ====================
-// ==================== Multithreading Optimization Opportunities ====================
-// CURRENT ARCHITECTURE: Sequential chunk processing (single-threaded)
-//   Read BUFFER_SIZE lines -> Calculate -> Write results -> Repeat
-//
-//
-
-
 void FileProcessor::ProcessTWMATimestamps(const string& csvFilename, long long windowStart,
                                           long long lastTimestamp) {
+    /* Compute time-weighted mean and standard deviation at each input timestamp.
+       Outputs one row per data point in the window. */
     cout << "Generating TWMA/TWSTD at input timestamps..." << endl;
     
     auto twmaCalc = make_shared<TWMACalculator>();
     
-    // Callback: for each data point, add to calculator and output if timestamp >= windowStart
     auto callback = [&](long long timestamp, double price, stringstream& writeBuffer, int& rowsWritten) {
         twmaCalc->AddNewValue(price, timestamp);
         if (timestamp >= windowStart) {
@@ -427,12 +404,13 @@ void FileProcessor::ProcessTWMATimestamps(const string& csvFilename, long long w
 
 void FileProcessor::ProcessTWMAIntervals(const string& csvFilename, long long windowStart,
                                          long long lastTimestamp) {
+    /* Compute time-weighted mean and standard deviation at fixed 1-second intervals.
+       Generates uniform time grid output even if data is sparse. */
     cout << "Generating TWMA/TWSTD at 1-second intervals..." << endl;
     
     auto twmaCalc = make_shared<TWMACalculator>();
     long long currentIntervalTime = windowStart;
     
-    // Callback: for each data point, advance intervals as timestamps arrive
     auto callback = [&](long long timestamp, double price, stringstream& writeBuffer, int& rowsWritten) {
         twmaCalc->AddNewValue(price, timestamp);
         while (currentIntervalTime <= timestamp && currentIntervalTime <= lastTimestamp) {
@@ -444,7 +422,6 @@ void FileProcessor::ProcessTWMAIntervals(const string& csvFilename, long long wi
         }
     };
     
-    // Finalize: output any remaining intervals after all data
     auto finalize = [&](stringstream& writeBuffer, int& rowsWritten) {
         while (currentIntervalTime <= lastTimestamp) {
             writeBuffer << currentIntervalTime << ","
@@ -461,11 +438,12 @@ void FileProcessor::ProcessTWMAIntervals(const string& csvFilename, long long wi
 
 void FileProcessor::ProcessTWMMTimestamps(const string& csvFilename, long long windowStart,
                                           long long lastTimestamp) {
+    /* Compute time-weighted median price at each input timestamp.
+       Outputs one row per data point in the window. */
     cout << "Generating TWMM at input timestamps..." << endl;
     
     auto twmmCalc = make_shared<TWMMCalculator>();
     
-    // Callback: for each data point, add to calculator and output if timestamp >= windowStart
     auto callback = [&](long long timestamp, double price, stringstream& writeBuffer, int& rowsWritten) {
         twmmCalc->AddNewValue(price, timestamp);
         if (timestamp >= windowStart) {
@@ -481,12 +459,13 @@ void FileProcessor::ProcessTWMMTimestamps(const string& csvFilename, long long w
 
 void FileProcessor::ProcessTWMMIntervals(const string& csvFilename, long long windowStart,
                                          long long lastTimestamp) {
+    /* Compute time-weighted median price at fixed 1-second intervals.
+       Generates uniform time grid output even if data is sparse. */
     cout << "Generating TWMM at 1-second intervals..." << endl;
     
     auto twmmCalc = make_shared<TWMMCalculator>();
     long long currentIntervalTime = windowStart;
     
-    // Callback: for each data point, advance intervals as timestamps arrive
     auto callback = [&](long long timestamp, double price, stringstream& writeBuffer, int& rowsWritten) {
         twmmCalc->AddNewValue(price, timestamp);
         while (currentIntervalTime <= timestamp && currentIntervalTime <= lastTimestamp) {
@@ -497,7 +476,6 @@ void FileProcessor::ProcessTWMMIntervals(const string& csvFilename, long long wi
         }
     };
     
-    // Finalize: output any remaining intervals after all data
     auto finalize = [&](stringstream& writeBuffer, int& rowsWritten) {
         while (currentIntervalTime <= lastTimestamp) {
             writeBuffer << currentIntervalTime << ","
