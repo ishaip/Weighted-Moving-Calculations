@@ -329,3 +329,287 @@ void FileProcessor::WriteCSV(const string& filename,
     file.close();
     std::cout << "Wrote " << timestamps.size() << " rows to " << filename << std::endl;
 }
+
+// ==================== Multithreading Optimization Opportunities ====================
+// CURRENT ARCHITECTURE: Sequential chunk processing (single-threaded)
+//   Read BUFFER_SIZE lines -> Calculate -> Write results -> Repeat
+//
+// STRATEGY 1: Producer-Consumer with Queue (Recommended)
+//   - Thread 1 (Reader):     Reads CSV chunks, pushes to thread-safe queue
+//   - Thread 2 (Processor):  Pops chunks, calculates sequentially, pushes results
+//   - Thread 3 (Writer):     Pops results, writes to file
+//   - Benefit: I/O and calculation overlap; hides latency
+//   - Implementation: std::queue + std::mutex + std::condition_variable
+//   - Constraint: Calculator must remain sequential (30s sliding window state)
+//
+// STRATEGY 2: Read-Ahead with std::async
+//   - Main thread processes current chunk
+//   - Background thread reads next chunk asynchronously
+//   - When done, next chunk ready in memory
+//   - Benefit: Simpler than thread pool; good for prefetch
+//   - Implementation: std::future<vector<string>> nextChunk
+//   - Limitation: Only hides read latency, not write/calculate
+//
+// STRATEGY 3: Parallel Writing Only
+//   - Keep calculation sequential, offload writes to separate thread
+//   - Main thread: process chunks, push results to write queue
+//   - Writer thread: drain write queue, flush to file
+//   - Benefit: Easiest to implement; reduces write blocking
+//   - Implementation: Simple queue + background writer thread
+//
+// KEY CONSTRAINT: Sequential Calculation
+//   - 30-second sliding window requires ordered state transitions
+//   - Chunk N state depends on final state of chunk N-1
+//   - Cannot parallelize across chunks
+//   - Only option: parallelize I/O around sequential calculation
+//
+// NEXT STEPS FOR MULTITHREADING:
+//   1. Add thread-safe queue wrapper class
+//   2. Create reader thread, populate queue with raw chunks
+//   3. Keep processor sequential, consume from queue
+//   4. Create writer thread, process output queue
+
+void FileProcessor::ProcessTWMATimestamps(const string& csvFilename, long long windowStart,
+                                          long long lastTimestamp) {
+    cout << "Generating TWMA/TWSTD at input timestamps..." << endl;
+    int rowsWritten = 0;
+
+    TWMACalculator twmaCalc;
+    ifstream inFile(csvFilename);
+    ofstream outFile("twma_twstd_timestamps.csv");
+    outFile << "Time,TWMA,TWSTD\n";
+
+    string line;
+    getline(inFile, line);  // Skip header
+
+    vector<string> readBuffer;
+    readBuffer.reserve(BUFFER_SIZE);
+
+    while (true) {
+        // Read a chunk of BUFFER_SIZE lines
+        readBuffer.clear();
+        while ((int)readBuffer.size() < BUFFER_SIZE && getline(inFile, line)) {
+            if (!line.empty()) readBuffer.push_back(line);
+        }
+        if (readBuffer.empty()) break;
+
+        // Process chunk: calculate results for each line
+        stringstream writeBuffer;
+        writeBuffer << fixed << setprecision(6);
+        for (const auto& bufLine : readBuffer) {
+            stringstream ss(bufLine);
+            string tsStr, priceStr;
+            getline(ss, tsStr, ',');
+            getline(ss, priceStr, ',');
+            long long timestamp = static_cast<long long>(stod(tsStr));
+            double price = stod(priceStr);
+            twmaCalc.AddNewValue(price, timestamp);
+            if (timestamp >= windowStart) {
+                writeBuffer << timestamp << ","
+                            << twmaCalc.GetCurrentValue(timestamp) << ","
+                            << twmaCalc.GetCurrentTWSTD(timestamp) << "\n";
+                ++rowsWritten;
+            }
+        }
+
+        // Write chunk results to file
+        outFile << writeBuffer.str();
+    }
+
+    inFile.close();
+    outFile.close();
+    cout << "Wrote " << rowsWritten << " rows to twma_twstd_timestamps.csv" << endl;
+}
+
+// ===== MULTITHREADING NOTE: Same parallelization pattern applies to interval processing =====
+// Chunk pipeline can use producer-consumer queue for I/O overlap
+// Calculation still sequential: must process 1-second intervals in order
+void FileProcessor::ProcessTWMAIntervals(const string& csvFilename, long long windowStart,
+                                         long long lastTimestamp) {
+    cout << "Generating TWMA/TWSTD at 1-second intervals..." << endl;
+    int rowsWritten = 0;
+
+    TWMACalculator twmaCalc;
+    ifstream inFile(csvFilename);
+    ofstream outFile("twma_twstd_intervals.csv");
+    outFile << "Time,TWMA,TWSTD\n";
+
+    string line;
+    getline(inFile, line);  // Skip header
+
+    long long currentIntervalTime = windowStart;
+    vector<string> readBuffer;
+    readBuffer.reserve(BUFFER_SIZE);
+
+    while (true) {
+        // Read a chunk of BUFFER_SIZE lines
+        readBuffer.clear();
+        while ((int)readBuffer.size() < BUFFER_SIZE && getline(inFile, line)) {
+            if (!line.empty()) readBuffer.push_back(line);
+        }
+        if (readBuffer.empty()) break;
+
+        // Process chunk: advance intervals as data arrives
+        stringstream writeBuffer;
+        writeBuffer << fixed << setprecision(6);
+        for (const auto& bufLine : readBuffer) {
+            stringstream ss(bufLine);
+            string tsStr, priceStr;
+            getline(ss, tsStr, ',');
+            getline(ss, priceStr, ',');
+            long long timestamp = static_cast<long long>(stod(tsStr));
+            double price = stod(priceStr);
+            twmaCalc.AddNewValue(price, timestamp);
+            while (currentIntervalTime <= timestamp && currentIntervalTime <= lastTimestamp) {
+                writeBuffer << currentIntervalTime << ","
+                            << twmaCalc.GetCurrentValue(currentIntervalTime) << ","
+                            << twmaCalc.GetCurrentTWSTD(currentIntervalTime) << "\n";
+                ++rowsWritten;
+                currentIntervalTime += 1000000000LL;
+            }
+        }
+
+        // Write chunk results to file
+        outFile << writeBuffer.str();
+    }
+
+    // Write any remaining intervals after all data
+    stringstream writeBuffer;
+    writeBuffer << fixed << setprecision(6);
+    while (currentIntervalTime <= lastTimestamp) {
+        writeBuffer << currentIntervalTime << ","
+                    << twmaCalc.GetCurrentValue(currentIntervalTime) << ","
+                    << twmaCalc.GetCurrentTWSTD(currentIntervalTime) << "\n";
+        ++rowsWritten;
+        currentIntervalTime += 1000000000LL;
+    }
+    outFile << writeBuffer.str();
+
+    inFile.close();
+    outFile.close();
+    cout << "Wrote " << rowsWritten << " rows to twma_twstd_intervals.csv" << endl;
+}
+
+// ===== MULTITHREADING NOTE: TWMM uses same chunk pipeline pattern =====
+// All 4 process methods can independently use producer-consumer queues
+// Multiple Process methods could run in parallel (separate threads) since they
+// operate on separate calculator instances and output files
+void FileProcessor::ProcessTWMMTimestamps(const string& csvFilename, long long windowStart,
+                                          long long lastTimestamp) {
+    cout << "Generating TWMM at input timestamps..." << endl;
+    int rowsWritten = 0;
+
+    TWMMCalculator twmmCalc;
+    ifstream inFile(csvFilename);
+    ofstream outFile("twmm_timestamps.csv");
+    outFile << "Time,TWMM\n";
+
+    string line;
+    getline(inFile, line);  // Skip header
+
+    vector<string> readBuffer;
+    readBuffer.reserve(BUFFER_SIZE);
+
+    while (true) {
+        // Read a chunk of BUFFER_SIZE lines
+        readBuffer.clear();
+        while ((int)readBuffer.size() < BUFFER_SIZE && getline(inFile, line)) {
+            if (!line.empty()) readBuffer.push_back(line);
+        }
+        if (readBuffer.empty()) break;
+
+        // Process chunk: calculate results for each line
+        stringstream writeBuffer;
+        writeBuffer << fixed << setprecision(6);
+        for (const auto& bufLine : readBuffer) {
+            stringstream ss(bufLine);
+            string tsStr, priceStr;
+            getline(ss, tsStr, ',');
+            getline(ss, priceStr, ',');
+            long long timestamp = static_cast<long long>(stod(tsStr));
+            double price = stod(priceStr);
+            twmmCalc.AddNewValue(price, timestamp);
+            if (timestamp >= windowStart) {
+                writeBuffer << timestamp << ","
+                            << twmmCalc.GetCurrentValue(timestamp) << "\n";
+                ++rowsWritten;
+            }
+        }
+
+        // Write chunk results to file
+        outFile << writeBuffer.str();
+    }
+
+    inFile.close();
+    outFile.close();
+    cout << "Wrote " << rowsWritten << " rows to twmm_timestamps.csv" << endl;
+}
+
+// ===== MULTITHREADING OPPORTUNITY: Process all 4 methods in parallel from main() =====
+// Currently: main() calls Process* methods sequentially
+// Optimization: Spawn 4 threads in main(), one for each Process* method
+// Benefits: 4x wall-clock speedup (each processes independently with own calculator/file)
+// Implementation: std::thread t1(...), t2(...), t3(...), t4(...); t1.join(); t2.join(); etc.
+void FileProcessor::ProcessTWMMIntervals(const string& csvFilename, long long windowStart,
+                                         long long lastTimestamp) {
+    cout << "Generating TWMM at 1-second intervals..." << endl;
+    int rowsWritten = 0;
+
+    TWMMCalculator twmmCalc;
+    ifstream inFile(csvFilename);
+    ofstream outFile("twmm_intervals.csv");
+    outFile << "Time,TWMM\n";
+
+    string line;
+    getline(inFile, line);  // Skip header
+
+    long long currentIntervalTime = windowStart;
+    vector<string> readBuffer;
+    readBuffer.reserve(BUFFER_SIZE);
+
+    while (true) {
+        // Read a chunk of BUFFER_SIZE lines
+        readBuffer.clear();
+        while ((int)readBuffer.size() < BUFFER_SIZE && getline(inFile, line)) {
+            if (!line.empty()) readBuffer.push_back(line);
+        }
+        if (readBuffer.empty()) break;
+
+        // Process chunk: advance intervals as data arrives
+        stringstream writeBuffer;
+        writeBuffer << fixed << setprecision(6);
+        for (const auto& bufLine : readBuffer) {
+            stringstream ss(bufLine);
+            string tsStr, priceStr;
+            getline(ss, tsStr, ',');
+            getline(ss, priceStr, ',');
+            long long timestamp = static_cast<long long>(stod(tsStr));
+            double price = stod(priceStr);
+            twmmCalc.AddNewValue(price, timestamp);
+            while (currentIntervalTime <= timestamp && currentIntervalTime <= lastTimestamp) {
+                writeBuffer << currentIntervalTime << ","
+                            << twmmCalc.GetCurrentValue(currentIntervalTime) << "\n";
+                ++rowsWritten;
+                currentIntervalTime += 1000000000LL;
+            }
+        }
+
+        // Write chunk results to file
+        outFile << writeBuffer.str();
+    }
+
+    // Write any remaining intervals after all data
+    stringstream writeBuffer;
+    writeBuffer << fixed << setprecision(6);
+    while (currentIntervalTime <= lastTimestamp) {
+        writeBuffer << currentIntervalTime << ","
+                    << twmmCalc.GetCurrentValue(currentIntervalTime) << "\n";
+        ++rowsWritten;
+        currentIntervalTime += 1000000000LL;
+    }
+    outFile << writeBuffer.str();
+
+    inFile.close();
+    outFile.close();
+    cout << "Wrote " << rowsWritten << " rows to twmm_intervals.csv" << endl;
+}

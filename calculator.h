@@ -87,7 +87,7 @@ public:
 // File processor for buffered CSV I/O
 class FileProcessor {
 private:
-    static constexpr int BUFFER_SIZE = 1000;  // Lines per buffer
+    static constexpr int BUFFER_SIZE = 10000;  // Lines per buffer
 
 public:
     FileProcessor() = default;
@@ -96,6 +96,16 @@ public:
     // Returns pair of (timestamps, prices)
     pair<vector<long long>, vector<double>> 
     ReadSecurityCSV(const string& filename);
+
+    // Stream processing methods - FileProcessor handles file I/O in chunks
+    void ProcessTWMATimestamps(const string& csvFilename, long long windowStart,
+                               long long lastTimestamp);
+    void ProcessTWMAIntervals(const string& csvFilename, long long windowStart,
+                              long long lastTimestamp);
+    void ProcessTWMMTimestamps(const string& csvFilename, long long windowStart,
+                               long long lastTimestamp);
+    void ProcessTWMMIntervals(const string& csvFilename, long long windowStart,
+                              long long lastTimestamp);
 
     // Write CSV with timestamp and single value column
     void WriteCSV(const string& filename, 
