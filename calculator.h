@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <list>
+#include <deque>
 #include <map>
 #include <string>
 #include <cmath>
@@ -20,40 +21,49 @@ struct DataPoint {
     DataPoint(long long ts, double p) : timestamp(ts), price(p), duration(0.0) {}
 };
 
-// Time-Weighted Moving Average and Standard Deviation Calculator
-class TWMACalculator {
-private:
-    vector<DataPoint> window;              // Vector holding all added entries
-    long long lastTimestamp = -1;               // Timestamp of last added value
-    double lastPrice = 0.0;                     // Price of last added value
-    
-    // Constants
+// Abstract base class for moving window calculations
+class MovingCalculator {
+protected:
     static constexpr long long WINDOW_SIZE_NS = 30000000000LL;  // 30 seconds in nanoseconds
+
+public:
+    virtual ~MovingCalculator() = default;
+
+    // Add a new price-timestamp pair
+    virtual void AddNewValue(double price, long long timestamp) = 0;
+
+    // Get current calculated value at time t
+    virtual double GetCurrentValue(long long t) = 0;
+};
+
+// Time-Weighted Moving Average and Standard Deviation Calculator
+class TWMACalculator : public MovingCalculator {
+private:
+    deque<DataPoint> window;               // Deque holding 30-second window of entries
+    double twmaRunningSum = 0.0;           // Weighted sum of completed entries
+    double lastPrice = 0.0;                // Price of last added value
+    
+    // Helper: Remove entries older than 30 seconds
+    void PruneWindow(long long windowStart);
 
 public:
     TWMACalculator() = default;
 
     // Add a new price-timestamp pair
-    void AddNewValue(double price, long long timestamp);
+    void AddNewValue(double price, long long timestamp) override;
 
     // Get current TWMA at time t
-    double GetCurrentTWMA(long long t);
+    double GetCurrentValue(long long t) override;
 
     // Get current TWSTD (Time-Weighted Standard Deviation) at time t
     double GetCurrentTWSTD(long long t);
 };
 
-// Time-Weighted Moving Median Calculator using dual-heap approach
-class TWMMCalculator {
+// Time-Weighted Moving Median Calculator
+class TWMMCalculator : public MovingCalculator {
 private:
-    list<DataPoint> entries;              // All entries in the moving window
-    
-    // Constants
-    static constexpr long long WINDOW_SIZE_NS = 30000000000LL;  // 30 seconds in nanoseconds
+    deque<DataPoint> window;               // Deque holding 30-second window of entries
     static constexpr long long HALF_WINDOW_NS = 15000000000LL;  // 15 seconds in nanoseconds
-
-    // Helper: Remove entries outside 30-second window
-    void PruneWindow(long long t);
 
     // Helper: Calculate cumulative durations for price levels
     struct PriceDuration {
@@ -62,16 +72,16 @@ private:
     };
 
     // Helper: Get sorted unique prices with cumulative durations
-    std::vector<PriceDuration> GetPriceLevels(long long t) const;
+    vector<PriceDuration> GetPriceLevels(long long t) const;
 
 public:
     TWMMCalculator() = default;
 
     // Add a new price-timestamp pair
-    void AddNewValue(double price, long long timestamp);
+    void AddNewValue(double price, long long timestamp) override;
 
     // Get current TWMM (Time-Weighted Moving Median) at time t
-    double GetCurrentTWMM(long long t);
+    double GetCurrentValue(long long t) override;
 };
 
 // File processor for buffered CSV I/O

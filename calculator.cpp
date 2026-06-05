@@ -9,61 +9,55 @@ using namespace std;
 
 // ==================== TWMACalculator Implementation ====================
 
-void TWMACalculator::AddNewValue(double price, long long timestamp) {
-    // Add new data point to vector (no pruning - keep all data for accurate queries)
-    window.push_back(DataPoint(timestamp, price));
-    lastTimestamp = timestamp;
-    lastPrice = price;
+void TWMACalculator::PruneWindow(long long windowStart) {
+    // Remove entries older than windowStart from the front of deque
+    while (!window.empty() && window.front().timestamp < windowStart) {
+        window.pop_front();
+    }
 }
 
-double TWMACalculator::GetCurrentTWMA(long long t) {
+void TWMACalculator::AddNewValue(double price, long long timestamp) {
+    // If we have a previous entry, calculate its duration and update running sums
+    if (!window.empty()) {
+        long long prevTimestamp = window.back().timestamp;
+        double prevPrice = window.back().price;
+        long long duration = timestamp - prevTimestamp;
+        
+        // Add to weighted sum
+        twmaRunningSum += prevPrice * duration;
+        
+        // For TWSTD calculation (we'll need TWMA later, so just accumulate for now)
+        // We'll calculate deviations in GetCurrentTWSTD
+    }
+    
+    // Add new entry
+    window.push_back(DataPoint(timestamp, price));
+    lastPrice = price;
+    
+    // Prune entries older than 30 seconds
+    long long windowStart = timestamp - WINDOW_SIZE_NS;
+    PruneWindow(windowStart);
+}
+
+double TWMACalculator::GetCurrentValue(long long t) {
     if (window.empty()) {
         return 0.0;
     }
-
+    
     long long windowStart = t - WINDOW_SIZE_NS;
-    double weightedSum = 0.0;
-
-    // Binary search to find the first entry >= windowStart-1 second (some buffer)
-    // We need entries whose endTime > windowStart, so we can skip earlier entries
-    size_t firstIdx = 0;
-    for (size_t i = 0; i < window.size(); ++i) {
-        if (i + 1 < window.size()) {
-            if (window[i + 1].timestamp > windowStart) {
-                firstIdx = i;
-                break;
-            }
-        } else {
-            firstIdx = i;
-            break;
-        }
+    
+    // Start with running sum of completed entries
+    double weightedSum = twmaRunningSum;
+    
+    // Add contribution of the last entry (its duration is from its timestamp to query time)
+    long long lastTimestamp = window.back().timestamp;
+    long long lastEntryStart = max(lastTimestamp, windowStart);
+    double lastEntryDuration = static_cast<double>(t - lastEntryStart);
+    
+    if (lastEntryDuration > 0) {
+        weightedSum += lastPrice * lastEntryDuration;
     }
-
-    // Direct vector iteration from firstIdx only
-    for (size_t i = firstIdx; i < window.size(); ++i) {
-        const auto& entry = window[i];
-        
-        // End time of this entry
-        long long entryEnd;
-        if (i + 1 < window.size()) {
-            entryEnd = window[i + 1].timestamp;
-        } else {
-            entryEnd = t;
-        }
-        
-        if (entryEnd <= windowStart) {
-            continue;
-        }
-        
-        long long startTime = std::max(entry.timestamp, windowStart);
-        long long actualEndTime = std::min(entryEnd, t);
-        
-        if (actualEndTime > startTime) {
-            double duration_ns = static_cast<double>(actualEndTime - startTime);
-            weightedSum += entry.price * duration_ns;
-        }
-    }
-
+    
     return weightedSum / WINDOW_SIZE_NS;
 }
 
@@ -71,116 +65,69 @@ double TWMACalculator::GetCurrentTWSTD(long long t) {
     if (window.empty()) {
         return 0.0;
     }
-
-    // First calculate TWMA
-    double twma = GetCurrentTWMA(t);
-
+    
+    double twma = GetCurrentValue(t);
+    
     long long windowStart = t - WINDOW_SIZE_NS;
     double sumSquaredDev = 0.0;
-
-    // Binary search to find the first entry >= windowStart-1 second
-    size_t firstIdx = 0;
+    
+    // Calculate sum of squared deviations for all entries in window
     for (size_t i = 0; i < window.size(); ++i) {
-        if (i + 1 < window.size()) {
-            if (window[i + 1].timestamp > windowStart) {
-                firstIdx = i;
-                break;
-            }
-        } else {
-            firstIdx = i;
-            break;
-        }
-    }
-
-    // Direct vector iteration from firstIdx only
-    for (size_t i = firstIdx; i < window.size(); ++i) {
-        const auto& entry = window[i];
-        
-        // End time of this entry
+        long long entryStart = window[i].timestamp;
         long long entryEnd;
+        
+        // Determine end time of this entry
         if (i + 1 < window.size()) {
             entryEnd = window[i + 1].timestamp;
         } else {
             entryEnd = t;
         }
         
-        if (entryEnd <= windowStart) {
-            continue;
-        }
+        // Clip to window boundaries
+        entryStart = max(entryStart, windowStart);
+        entryEnd = min(entryEnd, t);
         
-        long long startTime = std::max(entry.timestamp, windowStart);
-        long long actualEndTime = std::min(entryEnd, t);
-        
-        if (actualEndTime > startTime) {
-            double duration_ns = static_cast<double>(actualEndTime - startTime);
-            double deviation = entry.price - twma;
-            sumSquaredDev += duration_ns * deviation * deviation;
+        if (entryEnd > entryStart) {
+            double duration = static_cast<double>(entryEnd - entryStart);
+            double deviation = window[i].price - twma;
+            sumSquaredDev += duration * deviation * deviation;
         }
     }
-
+    
     double variance = sumSquaredDev / WINDOW_SIZE_NS;
-    return std::sqrt(variance);
+    return sqrt(variance);
 }
 
 // ==================== TWMMCalculator Implementation ====================
 
-void TWMMCalculator::PruneWindow(long long t) {
-    // Remove entries older than 30 seconds
-    long long windowStart = t - WINDOW_SIZE_NS;
-    
-    auto it = entries.begin();
-    while (it != entries.end()) {
-        if (it->timestamp < windowStart) {
-            it = entries.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 vector<TWMMCalculator::PriceDuration> TWMMCalculator::GetPriceLevels(long long t) const {
-    if (entries.empty()) {
+    if (window.empty()) {
         return {};
     }
 
     long long windowStart = t - WINDOW_SIZE_NS;
 
-    // Map of price to cumulative duration (more efficient than iterating multiple times)
+    // Map of price to cumulative duration
     map<double, double> priceDurations;
-    vector<DataPoint> windowEntries;
     
-    // Filter entries in window
-    for (const auto& entry : entries) {
-        if (entry.timestamp < windowStart) {
-            continue;
-        }
-        windowEntries.push_back(entry);
-    }
-
-    if (windowEntries.empty()) {
-        return {};
-    }
-
     // Calculate durations for each entry
-    for (size_t i = 0; i < windowEntries.size(); ++i) {
-        long long entryStart = windowEntries[i].timestamp;
+    for (size_t i = 0; i < window.size(); ++i) {
+        long long entryStart = window[i].timestamp;
         long long entryEnd;
 
-        if (i + 1 < windowEntries.size()) {
-            // End at start of next entry
-            entryEnd = windowEntries[i + 1].timestamp;
+        if (i + 1 < window.size()) {
+            entryEnd = window[i + 1].timestamp;
         } else {
-            // End at query time
             entryEnd = t;
         }
 
         // Clip to window boundaries
-        entryStart = std::max(entryStart, windowStart);
-        entryEnd = std::min(entryEnd, t);
+        entryStart = max(entryStart, windowStart);
+        entryEnd = min(entryEnd, t);
 
         if (entryEnd > entryStart) {
             double duration_ns = static_cast<double>(entryEnd - entryStart);
-            priceDurations[windowEntries[i].price] += duration_ns;
+            priceDurations[window[i].price] += duration_ns;
         }
     }
 
@@ -197,13 +144,17 @@ vector<TWMMCalculator::PriceDuration> TWMMCalculator::GetPriceLevels(long long t
 }
 
 void TWMMCalculator::AddNewValue(double price, long long timestamp) {
-    entries.push_back(DataPoint(timestamp, price));
-    // No pruning here - keep all data for accurate queries
+    window.push_back(DataPoint(timestamp, price));
+    
+    // Prune entries older than 30 seconds
+    long long windowStart = timestamp - WINDOW_SIZE_NS;
+    while (!window.empty() && window.front().timestamp < windowStart) {
+        window.pop_front();
+    }
 }
 
-double TWMMCalculator::GetCurrentTWMM(long long t) {
-    // No pruning - get price levels filters by window automatically
-    if (entries.empty()) {
+double TWMMCalculator::GetCurrentValue(long long t) {
+    if (window.empty()) {
         return 0.0;
     }
 
