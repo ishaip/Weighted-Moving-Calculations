@@ -43,11 +43,11 @@ int main() {
     cout << "Loaded " << timestamps.size() << " data points" << endl;
     cout << "First timestamp: " << firstTimestamp << endl;
     cout << "Last timestamp: " << lastTimestamp << endl;
-    couPass 2-5: Run the four independent calculation pipelines.
+    // Pass 2-5: Run the four independent calculation pipelines.
     // Each one re-opens the CSV file and streams chunks through its own calculator,
     // then writes to its own output file. There's zero shared state between them.
     //
-    // THREADING OPPORTUNITY: These 4 calls are embarrassingly parallel. Wrapping
+    // THREADING OPPORTUNITY: These 4 calls are parallel. Wrapping
     // them in std::async or std::thread would give ~4x speedup with minimal change:
     //   auto t1 = std::async(std::launch::async, [&] { return processor.ProcessTWMATimestamps(...); });
     //   auto t2 = std::async(std::launch::async, [&] { return processor.ProcessTWMAIntervals(...); });
