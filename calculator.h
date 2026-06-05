@@ -9,6 +9,7 @@
 #include <cmath>
 #include <utility>
 #include <algorithm>
+#include <functional>
 
 using namespace std;
 
@@ -120,6 +121,23 @@ public:
                   const vector<double>& values2,
                   const string& header1,
                   const string& header2);
+
+private:
+    // Generic chunk processor - unifies all 4 Process methods
+    // callback: called for each data line, receives (timestamp, price, writeBuffer, rowsWritten)
+    // finalize: called after all data processed (for interval tail output)
+    typedef std::function<void(long long, double, stringstream&, int&)> CallbackFunc;
+    typedef std::function<void(stringstream&, int&)> FinalizeCallback;
+    
+    void ProcessChunkedData(
+        const string& csvFilename,
+        const string& outputFilename,
+        const string& header,
+        long long windowStart,
+        long long lastTimestamp,
+        CallbackFunc callback,
+        FinalizeCallback finalize = nullptr
+    );
 };
 
 #endif // CALCULATOR_H
